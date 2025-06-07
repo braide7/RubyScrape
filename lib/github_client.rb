@@ -83,6 +83,7 @@ class GitHubClient
               url
               isPrivate
               isArchived
+              updatedAt
             }
           }
         }

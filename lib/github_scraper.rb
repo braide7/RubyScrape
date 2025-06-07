@@ -2,7 +2,7 @@ require_relative 'github_client'
 require 'concurrent-ruby'
 
 class GitHubScraper
-  def initialize(max_threads: 3)  
+  def initialize(max_threads: 10)  
     @client = GitHubClient.new(ENV['GITHUB_TOKEN'])
     @organization = 'vercel'
     @max_threads = max_threads
@@ -13,7 +13,7 @@ class GitHubScraper
       fallback_policy: :caller_runs
     )
     # Rate limiting controls
-    @request_semaphore = Concurrent::Semaphore.new(3) # Max 3 concurrent API requests
+    @request_semaphore = Concurrent::Semaphore.new(10) # Max 10 concurrent API requests
     @last_request_time = Concurrent::AtomicReference.new(Time.now)
     @rate_limit_delay = 1 # Base delay between requests in seconds
     @exponential_backoff = Concurrent::AtomicReference.new(1.0)
@@ -154,11 +154,15 @@ class GitHubScraper
     next true if repository.last_successful_run.nil?
     
     begin
+
+      last_github_update = repository.github_last_updated_at
+      last_run = repository.last_successful_run
+
       # Process if repository has been updated since last successful run
-      needs_update = repository.github_last_updated_at > repository.last_successful_run
+      needs_update = last_github_update > last_run
       
       unless needs_update
-        puts "Skipping #{repository.name} - no updates since last run (#{repository.last_successful_run})"
+        puts "Skipping #{repository.name} - no updates since last run"
       end
       
       needs_update
@@ -170,52 +174,55 @@ class GitHubScraper
 end
 
   def process_repository_pull_requests(repository)
-  puts "[Thread #{Thread.current.object_id}] Processing repository: #{repository.name}"
-  
-  has_next_page = true
-  after_cursor = nil
-  processed_count = 0
-  early_termination = false
-  
-  while has_next_page && !early_termination
-    result = @client.get_pull_requests_with_reviews(@organization, repository.name, after_cursor)
-    next unless result
+    puts "[Thread #{Thread.current.object_id}] Processing repository: #{repository.name}"
     
-    result['nodes'].each do |pr_data|
-      pr_updated_at = Time.parse(pr_data['updatedAt'])
+    has_next_page = true
+    after_cursor = nil
+    processed_count = 0
+    early_termination = false
+    
+    while has_next_page && !early_termination
+      result = rate_limited_request do
+        @client.get_pull_requests_with_reviews(@organization, repository.name, after_cursor)
+      end
+        next unless result
       
-      # Early termination: Since PRs are ordered by updated_at DESC,
-      # if we encounter a PR older than last run, we can stop processing
-      if repository.last_successful_run && pr_updated_at <= repository.last_successful_run
-        puts "[Thread #{Thread.current.object_id}] Early termination for #{repository.name} - reached PRs older than last run (#{repository.last_successful_run})"
-        early_termination = true
-        break
+      result['nodes'].each do |pr_data|
+        pr_updated_at = Time.parse(pr_data['updatedAt'])
+        
+        # Early termination: Since PRs are ordered by updated_at DESC,
+        # if we encounter a PR older than last run, we can stop processing
+        if repository.last_successful_run && pr_updated_at <= repository.last_successful_run
+          puts "[Thread #{Thread.current.object_id}] Early termination for #{repository.name} - reached PRs older than last run (#{repository.last_successful_run})"
+          early_termination = true
+          break
+        end
+        
+        save_pull_request(repository, pr_data)
+        processed_count += 1
       end
       
-      save_pull_request(repository, pr_data)
-      processed_count += 1
+      # Only continue pagination if we haven't hit early termination
+      if !early_termination
+        has_next_page = result['pageInfo']['hasNextPage']
+        after_cursor = result['pageInfo']['endCursor']
+        
+        puts "[Thread #{Thread.current.object_id}] Processed #{processed_count} updated PRs for #{repository.name}. Has next page: #{has_next_page}"
+      end
+
+      # Add small delay between pages for the same repository
+      sleep(0.5) if has_next_page
     end
     
-    # Only continue pagination if we haven't hit early termination
-    if !early_termination
-      has_next_page = result['pageInfo']['hasNextPage']
-      after_cursor = result['pageInfo']['endCursor']
-      
-      puts "[Thread #{Thread.current.object_id}] Processed #{processed_count} updated PRs for #{repository.name}. Has next page: #{has_next_page}"
+    if early_termination
+      puts "[Thread #{Thread.current.object_id}] Finished processing #{repository.name} - #{processed_count} PRs processed (early termination)"
+    else
+      puts "[Thread #{Thread.current.object_id}] Finished processing #{repository.name} - #{processed_count} PRs processed (complete)"
     end
+  rescue => e
+    puts "[Thread #{Thread.current.object_id}] Error processing repository #{repository.name}: #{e.message}"
+    raise e # Re-raise to be caught by the future
   end
-  
-  if early_termination
-    puts "[Thread #{Thread.current.object_id}] Finished processing #{repository.name} - #{processed_count} PRs processed (early termination)"
-  else
-    puts "[Thread #{Thread.current.object_id}] Finished processing #{repository.name} - #{processed_count} PRs processed (complete)"
-  end
-
-
-rescue => e
-  puts "[Thread #{Thread.current.object_id}] Error processing repository #{repository.name}: #{e.message}"
-  raise e # Re-raise to be caught by the future
-end
 
   def save_repository(repo_data)
     # Thread-safe database operations with retry logic
