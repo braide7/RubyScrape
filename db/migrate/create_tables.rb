@@ -14,6 +14,8 @@ class CreateTables < ActiveRecord::Migration[7.0]
       t.boolean :private, default: false
       t.boolean :archived, default: false
       t.string :github_id, null: false
+      t.datetime :last_successful_run
+      t.datetime :github_last_updated_at
       t.timestamps
     end
 
