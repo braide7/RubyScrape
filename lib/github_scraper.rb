@@ -2,7 +2,7 @@ require_relative 'github_client'
 require 'concurrent-ruby'
 
 class GitHubScraper
-  def initialize(max_threads: 3)  
+  def initialize(max_threads: 10)  
     @client = GitHubClient.new(ENV['GITHUB_TOKEN'])
     @organization = 'vercel'
     @max_threads = max_threads
@@ -13,7 +13,7 @@ class GitHubScraper
       fallback_policy: :caller_runs
     )
     # Rate limiting controls
-    @request_semaphore = Concurrent::Semaphore.new(3) # Max 3 concurrent API requests
+    @request_semaphore = Concurrent::Semaphore.new(10) # Max 10 concurrent API requests
     @last_request_time = Concurrent::AtomicReference.new(Time.now)
     @rate_limit_delay = 1 # Base delay between requests in seconds
     @exponential_backoff = Concurrent::AtomicReference.new(1.0)
@@ -115,56 +115,109 @@ class GitHubScraper
     
     repositories = Repository.all.to_a
     puts "Processing #{repositories.count} repositories across #{@max_threads} threads"
-    
-    # Use concurrent futures to track completion
-    futures = repositories.map do |repository|
-      Concurrent::Future.execute(executor: @thread_pool) do
-        process_repository_pull_requests(repository)
+
+    # Filter repositories that need processing
+    repositories_to_process = filter_repositories_needing_update(repositories)
+    puts "Filtered down to #{repositories_to_process.count} repositories that need updates"
+
+    if repositories_to_process.count > 0
+      # Use concurrent futures to track completion
+      futures = repositories_to_process.map do |repository|
+        Concurrent::Future.execute(executor: @thread_pool) do
+          process_repository_pull_requests(repository)
+        end
+      end
+      
+      # Wait for all futures to complete and handle any errors
+      completed = 0
+      futures.each_with_index do |future, index|
+        repository = repositories_to_process[index]
+        begin
+          future.wait
+          # Update timestamp only after successful processing of ALL PRs/reviews for this repository
+          repository.update!(last_successful_run: Time.current)
+          puts "Updated last successful run for #{repository.name}"
+          completed += 1
+          puts "Completed #{completed}/#{repositories_to_process.count} repositories"
+        rescue => e
+          puts "Error processing repository #{repositories_to_process[index].name}: #{e.message}"
+        end
       end
     end
-    
-    # Wait for all futures to complete and handle any errors
-    completed = 0
-    futures.each_with_index do |future, index|
-      begin
-        future.wait
-        
-        completed += 1
-        puts "Completed #{completed}/#{repositories.count} repositories"
-      rescue => e
-        puts "Error processing repository #{repositories[index].name}: #{e.message}"
-      end
-    end
-    
+
     puts "Finished processing all repositories"
   end
+
+  def filter_repositories_needing_update(repositories)
+  repositories.select do |repository|
+    # Skip if we've never run before (process all repos)
+    next true if repository.last_successful_run.nil?
+    
+    begin
+
+      last_github_update = repository.github_last_updated_at
+      last_run = repository.last_successful_run
+
+      # Process if repository has been updated since last successful run
+      needs_update = last_github_update > last_run
+      
+      unless needs_update
+        puts "Skipping #{repository.name} - no updates since last run"
+      end
+      
+      needs_update
+    rescue => e
+      puts "Error checking update status for #{repository.name}: #{e.message}"
+      true # Process on error to be safe
+    end
+  end
+end
 
   def process_repository_pull_requests(repository)
     puts "[Thread #{Thread.current.object_id}] Processing repository: #{repository.name}"
     
     has_next_page = true
     after_cursor = nil
-    page_count = 0
+    processed_count = 0
+    early_termination = false
     
-     while has_next_page
+    while has_next_page && !early_termination
       result = rate_limited_request do
         @client.get_pull_requests_with_reviews(@organization, repository.name, after_cursor)
       end
-      
-      next unless result
+        next unless result
       
       result['nodes'].each do |pr_data|
+        pr_updated_at = Time.parse(pr_data['updatedAt'])
+        
+        # Early termination: Since PRs are ordered by updated_at DESC,
+        # if we encounter a PR older than last run, we can stop processing
+        if repository.last_successful_run && pr_updated_at <= repository.last_successful_run
+          puts "[Thread #{Thread.current.object_id}] Early termination for #{repository.name} - reached PRs older than last run (#{repository.last_successful_run})"
+          early_termination = true
+          break
+        end
+        
         save_pull_request(repository, pr_data)
+        processed_count += 1
       end
       
-      has_next_page = result['pageInfo']['hasNextPage']
-      after_cursor = result['pageInfo']['endCursor']
-      page_count += 1
-      
-      puts "[Thread #{Thread.current.object_id}] Processed page #{page_count} for #{repository.name}. Has next page: #{has_next_page}"
-      
+      # Only continue pagination if we haven't hit early termination
+      if !early_termination
+        has_next_page = result['pageInfo']['hasNextPage']
+        after_cursor = result['pageInfo']['endCursor']
+        
+        puts "[Thread #{Thread.current.object_id}] Processed #{processed_count} updated PRs for #{repository.name}. Has next page: #{has_next_page}"
+      end
+
       # Add small delay between pages for the same repository
       sleep(0.5) if has_next_page
+    end
+    
+    if early_termination
+      puts "[Thread #{Thread.current.object_id}] Finished processing #{repository.name} - #{processed_count} PRs processed (early termination)"
+    else
+      puts "[Thread #{Thread.current.object_id}] Finished processing #{repository.name} - #{processed_count} PRs processed (complete)"
     end
   rescue => e
     puts "[Thread #{Thread.current.object_id}] Error processing repository #{repository.name}: #{e.message}"
@@ -179,6 +232,7 @@ class GitHubScraper
         repo.url = repo_data['url']
         repo.private = repo_data['isPrivate']
         repo.archived = repo_data['isArchived']
+        repo.github_last_updated_at = repo_data['updatedAt']
       end
     end
   rescue ActiveRecord::RecordNotUnique

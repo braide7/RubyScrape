@@ -26,7 +26,7 @@ if __FILE__ == $0
   run_migrations
   
   # Start scraping
-  scraper = GitHubScraper.new(max_threads: 3)
+  scraper = GitHubScraper.new(max_threads: 10)
   puts scraper.instance_variable_get(:@client).rate_limit_status
   scraper.scrape_all
   

@@ -83,6 +83,7 @@ class GitHubClient
               url
               isPrivate
               isArchived
+              updatedAt
             }
           }
         }
@@ -102,7 +103,7 @@ class GitHubClient
           resetAt
         }
         repository(owner: "#{owner}", name: "#{repo}") {
-          pullRequests(first: 100, states: [OPEN, CLOSED, MERGED]#{after_clause}) {
+          pullRequests(first: 100, states: [OPEN, CLOSED, MERGED], orderBy: {field: UPDATED_AT, direction: DESC}#{after_clause}) {
             pageInfo {
               hasNextPage
               endCursor
